@@ -1,166 +1,138 @@
 <?php
-if (PHP_SAPI == 'cli') {
-  $_SERVER['REMOTE_ADDR'] = null;
-  $_SERVER['HTTP_HOST'] = null;
-  $_SERVER['REQUEST_URI'] = $_SERVER['SCRIPT_NAME'];
+$_xhprof = array();
+
+// Change these:
+$_xhprof['dbtype'] = 'mysql'; // Only relevant for PDO
+$_xhprof['dbhost'] = '192.168.8.29';
+$_xhprof['dbuser'] = 'root';
+$_xhprof['dbpass'] = 'root';
+$_xhprof['dbname'] = 'xhprof';
+$_xhprof['dbadapter'] = 'Mysqli';
+$_xhprof['servername'] = 'myserver';
+$_xhprof['namespace'] = 'myapp';
+$_xhprof['url'] = 'http://url/to/xhprof/xhprof_html';
+$_xhprof['getparam'] = "_profile";
+
+/*
+ * MySQL/MySQLi/PDO ONLY
+ * Switch to JSON for better performance and support for larger profiler data sets.
+ * WARNING: Will break with existing profile data, you will need to TRUNCATE the profile data table.
+ */
+$_xhprof['serializer'] = 'php';
+
+//Uncomment one of these, platform dependent. You may need to tune for your specific environment, but they're worth a try
+
+//These are good for Windows
+/*
+$_xhprof['dot_binary']  = 'C:\\Programme\\Graphviz\\bin\\dot.exe';
+$_xhprof['dot_tempdir'] = 'C:\\WINDOWS\\Temp';
+$_xhprof['dot_errfile'] = 'C:\\WINDOWS\\Temp\\xh_dot.err';
+*/
+
+//These are good for linux and its derivatives.
+$_xhprof['dot_binary']  = '/usr/bin/dot';
+$_xhprof['dot_tempdir'] = '/tmp';
+$_xhprof['dot_errfile'] = '/tmp/xh_dot.err';
+
+$ignoreURLs = array();
+
+$ignoreDomains = array();
+
+$exceptionURLs = array();
+
+$exceptionPostURLs = array();
+$exceptionPostURLs[] = "login";
+
+
+$_xhprof['display'] = false;
+$_xhprof['doprofile'] = false;
+
+//Control IPs allow you to specify which IPs will be permitted to control when profiling is on or off within your application, and view the results via the UI.
+// $controlIPs = false; //Disables access controlls completely.
+$controlIPs = array();
+$controlIPs[] = "192.168.8.1";   // localhost, you'll want to add your own ip here
+$controlIPs[] = "::1";         // localhost IP v6
+
+//$otherURLS = array();
+
+// ignore builtin functions and call_user_func* during profiling
+//$ignoredFunctions = array('call_user_func', 'call_user_func_array', 'socket_select');
+
+//Default weight - can be overidden by an Apache environment variable 'xhprof_weight' for domain-specific values
+$weight = 100;
+
+if($domain_weight = getenv('xhprof_weight')) {
+    $weight = $domain_weight;
 }
 
-include(dirname(__FILE__) . '/../xhprof_lib/config.php');
+unset($domain_weight);
 
-function getExtensionName()
+/**
+ * The goal of this function is to accept the URL for a resource, and return a "simplified" version
+ * thereof. Similar URLs should become identical. Consider:
+ * http://example.org/stories.php?id=2323
+ * http://example.org/stories.php?id=2324
+ * Under most setups these two URLs, while unique, will have an identical execution path, thus it's
+ * worthwhile to consider them as identical. The script will store both the original URL and the
+ * Simplified URL for display and comparison purposes. A good simplified URL would be:
+ * http://example.org/stories.php?id=
+ *
+ * @param string $url The URL to be simplified
+ * @return string The simplified URL
+ */
+function _urlSimilartor($url)
 {
-    if (extension_loaded('tideways'))
-    {
-        return 'tideways';
-    }elseif(extension_loaded('xhprof')) {
-        return 'xhprof';
+    //This is an example
+    $url = preg_replace("!\d{4}!", "", $url);
+
+    // For domain-specific configuration, you can use Apache setEnv xhprof_urlSimilartor_include [some_php_file]
+    if($similartorinclude = getenv('xhprof_urlSimilartor_include')) {
+        require_once($similartorinclude);
     }
-    return false;
-}
-$_xhprof['ext_name'] = getExtensionName();
-if($_xhprof['ext_name'])
-{
-    $flagsCpu = constant(strtoupper($_xhprof['ext_name']).'_FLAGS_CPU');
-    $flagsMemory = constant(strtoupper($_xhprof['ext_name']).'_FLAGS_MEMORY');
-    $envVarName = strtoupper($_xhprof['ext_name']).'_PROFILE';
+
+    $url = preg_replace("![?&]_profile=\d!", "", $url);
+    return $url;
 }
 
-
-//I'm Magic :)
-class visibilitator
+function _aggregateCalls($calls, $rules = null)
 {
-	public static function __callstatic($name, $arguments)
-	{
-		$func_name = array_shift($arguments);
-		//var_dump($name);
-		//var_dump("arguments" ,$arguments);
-		//var_dump($func_name);
-		if (is_array($func_name))
-		{
-			list($a, $b) = $func_name;
-			if (count($arguments) == 0)
-			{
-				$arguments = $arguments[0];
-			}
-			return call_user_func_array(array($a, $b), $arguments);
-			//echo "array call  -> $b ($arguments)";
-		}else {
-			call_user_func_array($func_name, $arguments);
-		}
-	}
-}
+    $rules = array(
+        'Loading' => 'load::',
+        'mysql' => 'mysql_'
+    );
 
-// Only users from authorized IP addresses may control Profiling
-if ($controlIPs === false || in_array($_SERVER['REMOTE_ADDR'], $controlIPs) || PHP_SAPI == 'cli')
-{
-  /* Backwards Compatibility getparam check*/
-  if (!isset($_xhprof['getparam']))
-  {
-      $_xhprof['getparam'] = '_profile';
-  }
-  
-  if (isset($_GET[$_xhprof['getparam']]))
-  {
-    //Give them a cookie to hold status, and redirect back to the same page
-    setcookie('_profile', $_GET[$_xhprof['getparam']]);
-    $newURI = str_replace(array($_xhprof['getparam'].'=1',$_xhprof['getparam'].'=0'), '', $_SERVER['REQUEST_URI']);
-    header("Location: $newURI");
-    exit;
-  }
-  
-  if (isset($_COOKIE['_profile']) && $_COOKIE['_profile'] 
-          || PHP_SAPI == 'cli' && ( (isset($_SERVER[$envVarName]) && $_SERVER[$envVarName]) 
-          || (isset($_ENV[$envVarName]) && $_ENV[$envVarName])))
-  {
-      $_xhprof['display'] = true;
-      $_xhprof['doprofile'] = true;
-      $_xhprof['type'] = 1;
-  }
-  unset($envVarName);
-}
-
-
-//Certain URLs should never have a link displayed. Think images, xml, etc. 
-foreach($exceptionURLs as $url)
-{
-    if (stripos($_SERVER['REQUEST_URI'], $url) !== FALSE)
+    // For domain-specific configuration, you can use Apache setEnv xhprof_aggregateCalls_include [some_php_file]
+    if(isset($run_details['aggregateCalls_include']) && strlen($run_details['aggregateCalls_include']) > 1)
     {
-        $_xhprof['display'] = false;
-        header('X-XHProf-No-Display: Trueness');
-        break;
-    }    
-}
-unset($exceptionURLs);
-
-//Certain urls should have their POST data omitted. Think login forms, other privlidged info
-$_xhprof['savepost'] = true;
-foreach ($exceptionPostURLs as $url)
-{
-    if (stripos($_SERVER['REQUEST_URI'], $url) !== FALSE)
-    {
-        $_xhprof['savepost'] = false;
-        break;
-    }    
-}
-unset($exceptionPostURLs);
-
-//Determine wether or not to profile this URL randomly
-if ($_xhprof['doprofile'] === false)
-{
-    //Profile weighting, one in one hundred requests will be profiled without being specifically requested
-    if (rand(1, $weight) == 1)
-    {
-        $_xhprof['doprofile'] = true;
-        $_xhprof['type'] = 0;
-    } 
-}
-unset($weight);
-
-// Certain URLS should never be profiled.
-foreach($ignoreURLs as $url){
-    if (stripos($_SERVER['REQUEST_URI'], $url) !== FALSE)
-    {
-        $_xhprof['doprofile'] = false;
-        break;
+        require_once($run_details['aggregateCalls_include']);
     }
-}
-unset($ignoreURLs);
 
-unset($url);
-
-// Certain domains should never be profiled.
-foreach($ignoreDomains as $domain){
-    if (stripos($_SERVER['HTTP_HOST'], $domain) !== FALSE)
+    $addIns = array();
+    foreach($calls as $index => $call)
     {
-        $_xhprof['doprofile'] = false;
-        break;
+        foreach($rules as $rule => $search)
+        {
+            if (strpos($call['fn'], $search) !== false)
+            {
+                if (isset($addIns[$search]))
+                {
+                    unset($call['fn']);
+                    foreach($call as $k => $v)
+                    {
+                        $addIns[$search][$k] += $v;
+                    }
+                }else
+                {
+                    $call['fn'] = $rule;
+                    $addIns[$search] = $call;
+                }
+                unset($calls[$index]);  //Remove it from the listing
+                break;  //We don't need to run any more rules on this
+            }else
+            {
+                //echo "nomatch for $search in {$call['fn']}<br />\n";
+            }
+        }
     }
+    return array_merge($addIns, $calls);
 }
-unset($ignoreDomains);
-unset($domain);
-
-//Display warning if extension not available
-if ($_xhprof['ext_name'] && $_xhprof['doprofile'] === true) {
-    include_once dirname(__FILE__) . '/../xhprof_lib/utils/xhprof_lib.php';
-    include_once dirname(__FILE__) . '/../xhprof_lib/utils/xhprof_runs.php';
-    if (isset($ignoredFunctions) && is_array($ignoredFunctions) && !empty($ignoredFunctions)) {   
-        call_user_func($_xhprof['ext_name'].'_enable', $flagsCpu + $flagsMemory, array('ignored_functions' => $ignoredFunctions));
-    } else {
-        call_user_func($_xhprof['ext_name'].'_enable', $flagsCpu + $flagsMemory);
-    }
-    unset($flagsCpu);
-    unset($flagsMemory);
-    
-}elseif(false === $_xhprof['ext_name'] && $_xhprof['display'] === true)
-{
-    $message = 'Warning! Unable to profile run, tideways or xhprof extension not loaded';
-    trigger_error($message, E_USER_WARNING);
-}
-unset($flagsCpu);
-    unset($flagsMemory);
-function xhprof_shutdown_function() {
-    global $_xhprof;
-    require dirname(__FILE__).'/footer.php';
-}
-
-register_shutdown_function('xhprof_shutdown_function');
